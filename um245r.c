@@ -27,11 +27,11 @@
 #define DEVICE_PRIORITY 0
 
 #if defined(DEBUG) 
-#define DBG(...) KPrintF(__VA_ARGS__) 
-#define DBG_DUMP(B, L) { int _dbg; for (_dbg = 0; _dbg < (L); _dbg++) KPrintF("%02lx,", (unsigned long)B[_dbg]); }
+#define DBG(...) KPrintF("%s:%ld ", __FILE__, __LINE__); KPrintF(__VA_ARGS__) 
+#define TRACE DBG("%s\r\n", __FUNCTION__);
 #else
 #define DBG(...)
-#define DBG_DUMP(B, L)
+#define TRACE
 #endif
 
 
@@ -68,9 +68,9 @@ struct FTUnit {
     struct IOExtSer *ft_Reader;
     struct IOExtSer *ft_Writer;
     struct Process *ft_Task;
-    struct MsgPort *ft_ReadPort;
-    struct MsgPort *ft_WritePort;
-    struct MsgPort *ft_CommandPort;
+    volatile struct MsgPort *ft_ReadPort;
+    volatile struct MsgPort *ft_WritePort;
+    volatile struct MsgPort *ft_CommandPort;
 };
 
 struct FTUnit units[1] = {
@@ -154,8 +154,7 @@ CAUTION:
 This function runs in a forbidden state !!!                   
 This call is single-threaded by Exec
 ------------------------------------------------------------*/
-static struct Library __attribute__((used)) * init_device(BPTR seg_list asm("a0"), struct Library *dev asm("d0"))
-{
+static struct Library __attribute__((used)) * init_device(BPTR seg_list asm("a0"), struct Library *dev asm("d0")) { TRACE
     /* !!! required !!! save a pointer to exec */
     SysBase = *(struct ExecBase **)4UL;
     DOSBase  = (struct DosLibrary *) OpenLibrary("dos.library",0);
@@ -177,8 +176,7 @@ static struct Library __attribute__((used)) * init_device(BPTR seg_list asm("a0"
 !!! CAUTION: This function runs in a forbidden state !!! 
 This call is guaranteed to be single-threaded; only one task 
 will execute your Expunge at a time. */
-static BPTR __attribute__((used)) expunge(struct Library *dev asm("a6"))
-{
+static BPTR __attribute__((used)) expunge(struct Library *dev asm("a6")) { TRACE
     if (dev->lib_OpenCnt != 0)
     {
         dev->lib_Flags |= LIBF_DELEXP;
@@ -195,8 +193,7 @@ static BPTR __attribute__((used)) expunge(struct Library *dev asm("a6"))
 !!! CAUTION: This function runs in a forbidden state !!!
 This call is guaranteed to be single-threaded; only one task 
 will execute your Open at a time. */
-static void __attribute__((used)) open(struct Library *dev asm("a6"), struct IORequest *ioreq asm("a1"), ULONG unitnum asm("d0"), ULONG flags asm("d1"))
-{
+static void __attribute__((used)) open(struct Library *dev asm("a6"), struct IORequest *ioreq asm("a1"), ULONG unitnum asm("d0"), ULONG flags asm("d1")) { TRACE
     struct IOExtSer *sreq = (struct IOExtSer *)ioreq;
 
 
@@ -251,12 +248,15 @@ static void __attribute__((used)) open(struct Library *dev asm("a6"), struct IOR
     }
 
     thisUnit->ft_Task->pr_Task.tc_UserData = thisUnit;
+    DBG("Sending ^D\r\n");
     Signal(&thisUnit->ft_Task->pr_Task, SIGBREAKF_CTRL_D);
 
+    DBG("Wait for port\r\n");
     while (thisUnit->ft_CommandPort == NULL) {
         Delay(1);
     }
-    
+
+    DBG("System up\r\n");
 
     ioreq->io_Unit = (struct Unit *)thisUnit;
     
@@ -264,14 +264,14 @@ static void __attribute__((used)) open(struct Library *dev asm("a6"), struct IOR
     dev->lib_OpenCnt++;
     sreq->IOSer.io_Error = 0; 
     sreq->IOSer.io_Message.mn_Node.ln_Type = NT_REPLYMSG;
+    DBG("Open complete\r\n");
 }
 
 /* device dependent close function 
 !!! CAUTION: This function runs in a forbidden state !!!
 This call is guaranteed to be single-threaded; only one task 
 will execute your Close at a time. */
-static BPTR __attribute__((used)) close(struct Library *dev asm("a6"), struct IORequest *ioreq asm("a1"))
-{
+static BPTR __attribute__((used)) close(struct Library *dev asm("a6"), struct IORequest *ioreq asm("a1")) { TRACE
     ioreq->io_Device = NULL;
 
     struct FTUnit *thisUnit = (struct FTUnit *)ioreq->io_Unit;
@@ -301,8 +301,7 @@ static BPTR __attribute__((used)) close(struct Library *dev asm("a6"), struct IO
 }
 
 /* device dependent beginio function */
-static void __attribute__((used)) begin_io(struct Library *dev asm("a6"), struct IORequest *ioreq asm("a1"))
-{
+static void __attribute__((used)) begin_io(struct Library *dev asm("a6"), struct IORequest *ioreq asm("a1")) { TRACE
     struct IOExtSer *sreq = (struct IOExtSer *)ioreq;
     unsigned long i;
     const char *ptr;
@@ -330,25 +329,24 @@ static void __attribute__((used)) begin_io(struct Library *dev asm("a6"), struct
             // If there is enough data in the buffer we'll treat this like
             // an IOF_QUICK request regardless of if it were actually asked
             // for. 
+#if 0
             DBG("Read request: %ld bytes\r\n", sreq->IOSer.io_Length);
             if (ft_Available(thisUnit) >= sreq->IOSer.io_Length) {
-                DBG("Quick read\r\n");
+                Forbid();
                 for (i = 0; i < sreq->IOSer.io_Length; i++) {
                     int c = ft_Read(thisUnit);
                     sreq->IOSer.io_Actual++;
                     data[i] = c;
                     if (isTerminator(thisUnit, c) == 1) {
-                        DBG("Terminator found\r\n");
                         break;
                     }
                 }
-                DBG("Received data: [");
-                DBG_DUMP(data, sreq->IOSer.io_Actual);
-                DBG("\r\n");
                 sreq->IOSer.io_Flags |= IOF_QUICK;
                 ReplyMsg(&sreq->IOSer.io_Message);
+                Permit();
                 return;
             }
+#endif
 
             // Even if we've been asked for IOF_QUICK we should ignore it
             // since there isn't enough data available to directly honour it.
@@ -423,6 +421,7 @@ static void __attribute__((used)) begin_io(struct Library *dev asm("a6"), struct
             return;
 
         case SDCMD_QUERY:
+            DBG("SDCMD_QUERY\r\n");
             // Query will sort of fudge a few signals using the tx
             // and rx fifo indicators from the FT245R.
             sreq->io_Status = (
@@ -493,8 +492,7 @@ static void __attribute__((used)) begin_io(struct Library *dev asm("a6"), struct
 }
 
 /* device dependent abortio function */
-static ULONG __attribute__((used)) abort_io(struct Library *dev asm("a6"), struct IORequest *ioreq asm("a1"))
-{
+static ULONG __attribute__((used)) abort_io(struct Library *dev asm("a6"), struct IORequest *ioreq asm("a1")) { TRACE
     struct IOExtSer *sreq = (struct IOExtSer *)ioreq;
     sreq->IOSer.io_Flags |= IOF_QUICK;
     struct FTUnit *thisUnit = (struct FTUnit *)ioreq->io_Unit;
@@ -587,13 +585,15 @@ int ft_Read(struct FTUnit *u) {
     if (u->ft_Head == u->ft_Tail) {
         return -1;
     } else {
+        Forbid();
         theChar = u->ft_Buffer[u->ft_Tail];
         u->ft_Tail = (u->ft_Tail + 1) % u->ft_BufferSize;
+        Permit();
         return theChar;
     }
 }
 
-int ft_SetDefaultOptions(struct FTUnit *u) {
+int ft_SetDefaultOptions(struct FTUnit *u) { TRACE
     if (u->ft_Buffer != NULL) {
         FreeMem((char *)u->ft_Buffer, u->ft_BufferSize);
     }
@@ -620,14 +620,16 @@ void writeChar(struct FTUnit *u, char c) {
 // This is the main processing routine. It is spawned once
 // per unit and sits looking for incoming data and processes
 // any messages sent to it by the device driver.
-void commsManager() {
+void commsManager() { //TRACE
 
     struct IOExtSer *msg;   // The current incoming message cast as IOExtSer
     char done = 0;          // Flag to allow termination of the main loop
     char didSomething = 0;  // Has something been processed in this pass?
 
     // Wait for the signal that userdata is set
+    //DBG("Wait for ^D\r\n");
     Wait(SIGBREAKF_CTRL_D);
+    //DBG("^D received\r\n");
 
     // Get the unit structure for this task
     struct Task *self = FindTask(NULL);
@@ -637,12 +639,19 @@ void commsManager() {
         return;
     }
 
+    //DBG("Make ports\r\n");
+
     // Create a fresh message port. It is (supposedly) important that
     // the task waiting on the port creates the port, which is why we're
     // not using the default unit port.
+    Forbid();
     thisUnit->ft_ReadPort = CreateMsgPort();
     thisUnit->ft_WritePort = CreateMsgPort();
     thisUnit->ft_CommandPort = CreateMsgPort();
+    Permit();
+
+    //DBG("Ports made\r\n");
+
 
     while(!done) {
 
@@ -652,31 +661,42 @@ void commsManager() {
         // is anything available, and of course only if there is room in the RX
         // buffer to store it.
         if ((*thisUnit->ft_Status & FT_RXF) == 0) { // There is something to read
+            Forbid();
             unsigned long bufIndex = (thisUnit->ft_Head + 1) % thisUnit->ft_BufferSize;
             if (bufIndex != thisUnit->ft_Tail) { // There is room to read it into the buffer
                 char c = *thisUnit->ft_Fifo;
+                DBG("RX %ld\r\n", c);
                 thisUnit->ft_Buffer[thisUnit->ft_Head] = c;
                 thisUnit->ft_Head = bufIndex;
                 didSomething = 1;
+                DBG("Avail: %ld\r\n", ft_Available(thisUnit));
             }
+            Permit();
         }
 
         // Now we'll get some data for the active read message if there is one.
-        if ((thisUnit->ft_Reader != NULL) && (ft_Available(thisUnit) > 0)) {
-            unsigned char *data = (unsigned char *)thisUnit->ft_Reader->IOSer.io_Data;
-            int c = ft_Read(thisUnit);
-            data[thisUnit->ft_Reader->IOSer.io_Actual++] = c;
-            if (isTerminator(thisUnit, c) == 1) {
-                ReplyMsg(&thisUnit->ft_Reader->IOSer.io_Message);
-                thisUnit->ft_Reader = NULL;
-            } else if (thisUnit->ft_Reader->IOSer.io_Actual == thisUnit->ft_Reader->IOSer.io_Length) {
-                ReplyMsg(&thisUnit->ft_Reader->IOSer.io_Message);
-                thisUnit->ft_Reader = NULL;
+        if (thisUnit->ft_Reader != NULL) {
+            if (ft_Available(thisUnit) > 0) {
+                unsigned char *data = (unsigned char *)thisUnit->ft_Reader->IOSer.io_Data;
+                int c = ft_Read(thisUnit);
+                data[thisUnit->ft_Reader->IOSer.io_Actual++] = c;
+                DBG("Add %ld\r\n", c);
+                if (isTerminator(thisUnit, c) == 1) {
+                    ReplyMsg(&thisUnit->ft_Reader->IOSer.io_Message);
+                    thisUnit->ft_Reader = NULL;
+                } else if (thisUnit->ft_Reader->IOSer.io_Actual == thisUnit->ft_Reader->IOSer.io_Length) {
+                    ReplyMsg(&thisUnit->ft_Reader->IOSer.io_Message);
+                    DBG("Rd done: %ld\r\n", thisUnit->ft_Reader->IOSer.io_Actual);
+                    thisUnit->ft_Reader = NULL;
+                }
+                didSomething = 1;
             }
-            didSomething = 1;
         } else { // Look for a new message
             thisUnit->ft_Reader = (struct IOExtSer *)GetMsg(thisUnit->ft_ReadPort);
-            thisUnit->ft_Reader->IOSer.io_Actual = 0;
+            if (thisUnit->ft_Reader != NULL) {
+                thisUnit->ft_Reader->IOSer.io_Actual = 0;
+                DBG("New reader\r\n");
+            }
         }
 
         // And if there's an active write message we'll send the next byte.
@@ -696,7 +716,9 @@ void commsManager() {
             didSomething = 1;
         } else { // Look for a new message
             thisUnit->ft_Writer = (struct IOExtSer *)GetMsg(thisUnit->ft_WritePort);
-            thisUnit->ft_Writer->IOSer.io_Actual = 0;
+            if (thisUnit->ft_Writer != NULL) {
+                thisUnit->ft_Writer->IOSer.io_Actual = 0;
+            }
         }
 
         msg = (struct IOExtSer *)GetMsg(thisUnit->ft_CommandPort);
@@ -741,7 +763,8 @@ void commsManager() {
         // This might (though don't quote me as I don't understand the scheduler)
         // allow other tasks more processing and "lighten" this one while idling.
         if (didSomething == 0) { 
-            Delay(1);
+//            DBG("Tick\r\n");
+//            Delay(1);
         }
     }
 
