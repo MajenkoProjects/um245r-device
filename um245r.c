@@ -330,11 +330,15 @@ static void __attribute__((used)) begin_io(struct Library *dev asm("a6"), struct
             // If there is enough data in the buffer we'll treat this like
             // an IOF_QUICK request regardless of if it were actually asked
             // for. 
+/*
             if (ft_Available(thisUnit) >= sreq->IOSer.io_Length) {
                 //DBG("Quick Read request: %ld bytes\r\n", sreq->IOSer.io_Length);
                 Forbid();
                 for (i = 0; i < sreq->IOSer.io_Length; i++) {
                     int c = ft_Read(thisUnit);
+                    if (c == -1) {
+                        DBG("MAIN RD -1\r\n");
+                    }
                     sreq->IOSer.io_Actual++;
                     data[i] = c;
                     if (isTerminator(thisUnit, c) == 1) {
@@ -346,6 +350,7 @@ static void __attribute__((used)) begin_io(struct Library *dev asm("a6"), struct
                 Permit();
                 return;
             }
+*/
             // Even if we've been asked for IOF_QUICK we should ignore it
             // since there isn't enough data available to directly honour it.
             // Task switching will still be needed to get the data, so blocking
@@ -442,7 +447,7 @@ static void __attribute__((used)) begin_io(struct Library *dev asm("a6"), struct
             );
             sreq->IOSer.io_Actual = ft_Available(thisUnit);
             sreq->IOSer.io_Flags |= IOF_QUICK;
-            //DBG("SDCMD_QUERY -> %lu\r\n", sreq->IOSer.io_Actual);
+            DBG("SDCMD_QUERY -> %lu\r\n", sreq->IOSer.io_Actual);
             ReplyMsg(&sreq->IOSer.io_Message);
             return;
 
@@ -575,9 +580,19 @@ void syncMsg(struct FTUnit *u, unsigned long command) {
 // of a unit.
 inline unsigned long ft_Available(struct FTUnit *u) {
     Forbid();
-    unsigned long a = (u->ft_BufferSize + u->ft_Head - u->ft_Tail) % u->ft_BufferSize;
+
+    unsigned long reserved = 0;
+
+    // If there is a reader then find the number of bytes it needs
+    if (u->ft_Reader != NULL) {
+        reserved = u->ft_Reader->IOSer.io_Length - u->ft_Reader->IOSer.io_Actual;
+    }
+
+    unsigned long available = (u->ft_BufferSize + u->ft_Head - u->ft_Tail) % u->ft_BufferSize;
     Permit();
-    return a;
+
+    if (reserved >= available) return 0;
+    return available - reserved;
 }
 
 // Read the next byte from the RX buffer of a unit, or return -1 if
@@ -619,6 +634,7 @@ void writeChar(struct FTUnit *u, char c) {
     *u->ft_Fifo = c;
 }
 
+
 // This is the main processing routine. It is spawned once
 // per unit and sits looking for incoming data and processes
 // any messages sent to it by the device driver.
@@ -626,7 +642,6 @@ void commsManager() { //
 
     struct IOExtSer *msg;   // The current incoming message cast as IOExtSer
     char done = 0;          // Flag to allow termination of the main loop
-    char didSomething = 0;  // Has something been processed in this pass?
     unsigned long i;
 
     // Wait for the signal that userdata is set
@@ -656,62 +671,95 @@ void commsManager() { //
     //DBG("Ports made\r\n");
 
 
+    unsigned long iterations = 0;
+
     while(!done) {
 
-        didSomething = 0;
 
         // The first thing to do is grab a byte from the FT245R's FIFO if there
         // is anything available, and of course only if there is room in the RX
         // buffer to store it.
-        if ((*thisUnit->ft_Status & FT_RXF) == 0) { // There is something to read
-            Forbid();
+        while ((*thisUnit->ft_Status & FT_RXF) == 0) { // There is something to read
             unsigned long bufIndex = (thisUnit->ft_Head + 1) % thisUnit->ft_BufferSize;
-            if (bufIndex != thisUnit->ft_Tail) { // There is room to read it into the buffer
-                char c = *thisUnit->ft_Fifo;
-                thisUnit->ft_Buffer[thisUnit->ft_Head] = c;
-                thisUnit->ft_Head = bufIndex;
-                didSomething = 1;
-                DBG("RX %lu (%lu)\r\n", c, ft_Available(thisUnit));
+            // If there's no room left in the buffer then stop reading
+            if (bufIndex == thisUnit->ft_Tail) { 
+                break;
             }
-            Permit();
+
+            // Grab the character from the fifo
+            char c = *thisUnit->ft_Fifo;
+            // Store it in the buffer
+            thisUnit->ft_Buffer[thisUnit->ft_Head] = c;
+            // Advance the head
+            thisUnit->ft_Head = bufIndex;
         }
 
         // Now we'll get some data for the active read message if there is one.
         if (TUR != NULL) {
-            unsigned long cando = ft_Available(thisUnit);
+            unsigned long cando = (thisUnit->ft_BufferSize + thisUnit->ft_Head - thisUnit->ft_Tail) % thisUnit->ft_BufferSize;
+            // If we have at least one byte available
             if (cando > 0) {
                 unsigned char *data = (unsigned char *)TUR->IOSer.io_Data;
 
+                DBG("Have %lu\r\n", cando);
+                // We don't want to read more than we need to read
                 if (cando > (TUR->IOSer.io_Length - TUR->IOSer.io_Actual)) {
                     cando = TUR->IOSer.io_Length - TUR->IOSer.io_Actual;
                 }
 
                 DBG("Read %lu\r\n", cando);
 
+                iterations = 0;
+
+                // Read each character from the buffer
                 for (i = 0; i < cando; i++) {
                     int c = ft_Read(thisUnit);
+
+                    // If it's not a valid character then throw a wobbly.
+                    // NOTE: This should *never* happen.
+                    if (c == -1) {
+                        DBG("TASK RD -1\r\n");
+                    }
+                    // Store the character in the reader
                     data[TUR->IOSer.io_Actual++] = c;
+
+                    // Test if it's the terminating character or not
                     if (isTerminator(thisUnit, c) == 1) {
                         DBG("!T!\r\n");
+                        // Finish the read and reply
                         ReplyMsg(&TUR->IOSer.io_Message);
                         TUR = NULL;
                         break;
                     }
                 }
 
-                if (thisUnit != NULL) {
+                // If we didn't terminate above
+                if (TUR != NULL) {
+                    // If we have read enough characters to satisfy the reader
                     if (TUR->IOSer.io_Actual >= TUR->IOSer.io_Length) {
                         DBG("FIN: %lu\r\n", TUR->IOSer.io_Actual);
+                        // Finish the read and reply
                         ReplyMsg(&TUR->IOSer.io_Message);
                         thisUnit->ft_Reader = NULL;
                     }
                 }
-                didSomething = 1;
+            } else {
+                if (TUR != NULL) {
+                    iterations++;
+                    if (iterations > 200000) {
+                        TUR->IOSer.io_Error = IOERR_ABORTED;
+                        DBG("Timeout\r\n");
+                        ReplyMsg(&TUR->IOSer.io_Message);
+                        TUR = NULL;
+                    }
+                }
             }
         } else { // Look for a new message
             TUR = (struct IOExtSer *)GetMsg(thisUnit->ft_ReadPort);
             if (TUR != NULL) {
+                // If we got a new message prep it 
                 TUR->IOSer.io_Actual = 0;
+                iterations = 0;
                 DBG("New reader (%lu)\r\n", TUR->IOSer.io_Length);
             }
         }
@@ -730,7 +778,6 @@ void commsManager() { //
                 ReplyMsg(&thisUnit->ft_Writer->IOSer.io_Message);
                 thisUnit->ft_Writer = NULL;
             }
-            didSomething = 1;
         } else { // Look for a new message
             thisUnit->ft_Writer = (struct IOExtSer *)GetMsg(thisUnit->ft_WritePort);
             if (thisUnit->ft_Writer != NULL) {
@@ -773,16 +820,11 @@ void commsManager() { //
                     break;
         
             }
-            didSomething = 1;
         }
 
         // If nothing was done during this pass we'll introduce a very small delay.
         // This might (though don't quote me as I don't understand the scheduler)
         // allow other tasks more processing and "lighten" this one while idling.
-        if (didSomething == 0) { 
-//            DBG("Tick\r\n");
-//            Delay(10);
-        }
     }
 
 
