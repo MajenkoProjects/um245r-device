@@ -11,4 +11,9 @@ um245r.device: um245r.o
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 clean: 
-	rm -f um245r.device um245r.o
+	rm -f um245r.device um245r.o um245r.adf
+
+um245r.adf: um245r.device
+	xdftool um245r.adf create
+	xdftool um245r.adf format UM245R
+	xdftool um245r.adf write um245r.device
